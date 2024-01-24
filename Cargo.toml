@@ -1,0 +1,19 @@
+[package]
+name = "rusty-pingponger"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dotenv = "0.15.0"
+env_logger = "0.11.0"
+ethers = "2.0.11"
+ethers-core = "2.0.12"
+ethers-middleware = "2.0.11"
+ethers-providers = "2.0.11"
+ethers-signers = "2.0.11"
+eyre = "0.6.11"
+log = "0.4.20"
+sqlx = { version = "0.7.3", features = ["sqlite", "runtime-tokio-native-tls"] }
+tokio = { version = "1.35.1", features = ["full", "macros"] }
