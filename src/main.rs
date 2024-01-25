@@ -19,15 +19,16 @@ use sqlx::{
     Row,
 };
 use tokio::time::{sleep, Duration};
-use log::{info};
+use log;
 
+// type ProviderType = NonceManagerMiddleware<GasEscalatorMiddleware<SignerMiddleware<Provider<Http>, Wallet<SigningKey>>>>;
 type ProviderType = NonceManagerMiddleware<SignerMiddleware<Provider<Http>, Wallet<SigningKey>>>;
 abigen!(PingPong, "PingPongContract.json");
 
 async fn collect_and_insert_pings(db: &Pool<Sqlite>, contract: Arc<PingPong<ProviderType>>, start_block: u64) -> Result<()> {
     let from_block = get_last_seen_block_number(&db).await?.unwrap_or(start_block).max(start_block);
     let vec_ping_event_with_meta = get_ping_events(&contract, from_block).await?;
-    info!("collect_and_insert_pings: {} new pings", vec_ping_event_with_meta.len());
+    log::info!("collect_and_insert_pings: {} new pings", vec_ping_event_with_meta.len());
     insert_pings(&db, vec_ping_event_with_meta).await?;
 
     Ok(())
@@ -35,12 +36,12 @@ async fn collect_and_insert_pings(db: &Pool<Sqlite>, contract: Arc<PingPong<Prov
 
 async fn sync_pong_calls(db: &Pool<Sqlite>, provider: Arc<ProviderType>) -> Result<()> {
     let rows = get_pings_called(&db).await?;
-    info!("sync_pong_calls: {} pongs to sync", rows.len());
+    log::info!("sync_pong_calls: {} pongs to sync", rows.len());
     for (ping_tx_hash, optional_pong_tx_hash) in rows.into_iter() {
         let tx_status = check_tx_status(Arc::clone(&provider), optional_pong_tx_hash.unwrap()).await?;
         if tx_status {
             update_ping_status_to_completed(&db, ping_tx_hash).await?;
-            info!("sync_pong_calls: {} ponged by {}", ping_tx_hash, optional_pong_tx_hash.unwrap());
+            log::info!("sync_pong_calls: {} ponged by {}", ping_tx_hash, optional_pong_tx_hash.unwrap());
         }
     }
 
@@ -70,32 +71,9 @@ async fn send_pong_call(contract: Arc<PingPong<ProviderType>>, ping_tx_hash: Has
     Ok(pong_pending_tx_hash)
 }
 
-// async fn resend_pong_call(contract: Arc<PingPong<ProviderType>>, ping_tx_hash: Hash) -> Result<Hash> {
-//     let tx_raw = TransactionRequest::new()
-//         // .chain_id(Chain::Goerli)
-//         .to(contract.address())
-//         .data(contract.pong(ping_tx_hash.into()).calldata().unwrap())
-//         .value(0)
-//         .with_access_list(
-//             AccessList(
-//                 vec![
-//                     AccessListItem { 
-//                         address: contract.address(), 
-//                         storage_keys: vec![], 
-//                     }
-//                 ]
-//             )
-//         );
-
-//     let pending_pong_transaction = contract.client_ref().send_transaction(tx_raw, None).await?;
-//     let pong_pending_tx_hash = pending_pong_transaction.tx_hash();
-
-//     Ok(pong_pending_tx_hash)
-// }
-
 async fn send_pong_calls(db: &Pool<Sqlite>, contract: Arc<PingPong<ProviderType>>) -> Result<()> {
     let rows = get_pings_seen(&db).await?;
-    info!("send_pong_calls: {} pongs to call", rows.len());
+    log::info!("send_pong_calls: {} pongs to call", rows.len());
     for (ping_tx_hash, _) in rows.into_iter() {
         let pong_pending_tx_hash = send_pong_call(Arc::clone(&contract), ping_tx_hash).await?;
 
@@ -105,8 +83,24 @@ async fn send_pong_calls(db: &Pool<Sqlite>, contract: Arc<PingPong<ProviderType>
             pong_pending_tx_hash,
         ).await?;
 
-        info!("send_pong_calls: {} ping called by pong {}", ping_tx_hash, pong_pending_tx_hash);
+        log::info!("send_pong_calls: {} ping called by pong {}", ping_tx_hash, pong_pending_tx_hash);
     }
+
+    Ok(())
+}
+
+async fn loopy(db: &Pool<Sqlite>, contract: Arc<PingPong<ProviderType>>, provider: Arc<ProviderType>, start_block: u64, sleep_duration_in_secs: u64) -> Result<()> {
+    // get new ping txs
+    collect_and_insert_pings(&db, Arc::clone(&contract), start_block).await?;
+    // send pong txs
+    send_pong_calls(&db, Arc::clone(&contract)).await?;
+
+    // sleep
+    log::info!("sleeping for {sleep_duration_in_secs} seconds");
+    sleep(Duration::from_secs(sleep_duration_in_secs)).await;
+
+    // sync rows with status called
+    sync_pong_calls(&db, Arc::clone(&provider)).await?;
 
     Ok(())
 }
@@ -122,7 +116,7 @@ async fn main() -> Result<()> {
     let start_block = env::var("START_BLOCK").unwrap_or("0".to_string()).parse::<u64>()?;
     let goerli_https_rpc_url = env::var("GOERLI_HTTPS_RPC_URL").expect("'GOERLI_HTTPS_RPC_URL' is not set");
     let private_key = env::var("PRIVATE_KEY").expect("'PRIVATE_KEY' is not set");
-    const SLEEP_DURATION: u64 = 30_000;
+    const SLEEP_DURATION_IN_SECS: u64 = 60;
 
     // create signer, provider and contract
     let signer = private_key.parse::<LocalWallet>()?.with_chain_id(Chain::Goerli);
@@ -140,20 +134,17 @@ async fn main() -> Result<()> {
     sync_pong_calls(&db, Arc::clone(&provider)).await?;
 
     loop {
-        // get new ping txs
-        collect_and_insert_pings(&db, Arc::clone(&contract), start_block).await?;
-        // send pong txs
-        send_pong_calls(&db, Arc::clone(&contract)).await?;
-
-        // sleep
-        info!("sleeping for {SLEEP_DURATION} millis");
-        sleep(Duration::from_millis(SLEEP_DURATION)).await;
-
-        // sync rows with status called
-        sync_pong_calls(&db, Arc::clone(&provider)).await?;
+        match loopy(&db, Arc::clone(&contract), Arc::clone(&provider), start_block, SLEEP_DURATION_IN_SECS).await {
+            Ok(_) => {},
+            Err(e) => {
+                log::info!("{e}");
+                log::info!("sleeping for {SLEEP_DURATION_IN_SECS} seconds");
+                sleep(Duration::from_secs(SLEEP_DURATION_IN_SECS)).await;
+            },
+        }
     }
 
-    Ok(())
+    // Ok(())
 }
 
 async fn setup_provider(goerli_https_rpc_url: String, signer: Wallet<SigningKey>) -> Result<Arc<ProviderType>> {
@@ -162,12 +153,11 @@ async fn setup_provider(goerli_https_rpc_url: String, signer: Wallet<SigningKey>
     let provider = Provider::<Http>::try_connect(&goerli_https_rpc_url).await?;
     // Signer middleware
     let provider = SignerMiddleware::new_with_provider_chain(provider, signer).await?;
-    // // NonceManager middleware
-    let provider = NonceManagerMiddleware::new(provider, signer_address);
-
     // // GasEscalator middleware
     // let escalator = GeometricGasPrice::new(1.125_f64, 30_u64, None::<u64>);
     // let provider = GasEscalatorMiddleware::new(provider, escalator, Frequency::PerBlock);
+    // NonceManager middleware
+    let provider = NonceManagerMiddleware::new(provider, signer_address);
 
     Ok(Arc::new(provider))
 }
@@ -177,8 +167,6 @@ async fn create_contract_instance(provider: Arc<ProviderType>, contract_address:
 
     Ok(Arc::new(contract))
 }
-
-// async fn call_pong(contract: PingPong<ProviderType>, gas_price: Optip)
 
 async fn check_tx_status(provider: Arc<ProviderType>, tx_hash: Hash) -> Result<bool> {
     let res = match provider.get_transaction_receipt(tx_hash).await? {
@@ -205,13 +193,13 @@ async fn get_ping_events<T>(contract: &PingPong<ProviderType>, from_block: T) ->
 
 async fn create_db_if_not_exists(db_url: &str) -> Result<()> {
     if !Sqlite::database_exists(db_url).await.unwrap_or(false) {
-        info!("Creating database {}", db_url);
+        log::info!("Creating database {}", db_url);
         match Sqlite::create_database(db_url).await {
-            Ok(_) => info!("Create db success"),
+            Ok(_) => log::info!("Create db success"),
             Err(error) => panic!("error: {}", error),
         }
     } else {
-        info!("Database already exists");
+        log::info!("Database already exists");
     }
 
     Ok(())
@@ -291,7 +279,7 @@ async fn get_pings_called(db: &Pool<Sqlite>) -> Result<Vec<(Hash, Option<Hash>)>
     get_pings_by_status(db, 1).await
 }
 
-async fn get_pings_completed(db: &Pool<Sqlite>) -> Result<Vec<(Hash, Option<Hash>)>> {
+async fn _get_pings_completed(db: &Pool<Sqlite>) -> Result<Vec<(Hash, Option<Hash>)>> {
     get_pings_by_status(db, 2).await
 }
 
